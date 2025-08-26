@@ -1,7 +1,3 @@
----
-jupyter: julia-1.11
----
-
 Explanation
 
 We begin by loading the necessary Julia packages and reading the source datasets.
