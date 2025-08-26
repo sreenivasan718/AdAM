@@ -1,0 +1,322 @@
+---
+jupyter: julia-1.11
+---
+
+Explanation
+
+We begin by loading the necessary Julia packages and reading the source datasets.
+
+    DataFrames.jl: The core package for working with tabular data, similar to R's data.frame or Python's pandas.
+
+    CSV.jl: Used to efficiently read data from CSV files into a DataFrame.
+
+    Dates: A standard library for handling and calculating with date/time objects, essential for any Time-to-Event (TTE) analysis.
+
+The adsl (Subject-Level Analysis) and adrs (Response Structure) datasets are loaded into memory, forming the basis of our analysis.
+
+Abbreviations:
+
+    ADSL: Analysis Data Subject-Level
+
+    ADRS: Analysis Data Response Structure
+
+```{julia}
+using CSV
+using DataFrames
+using Dates
+```
+
+```{julia}
+dt_format = dateformat"y-m-d"
+
+adsl = CSV.read("adsl.csv", DataFrame,
+    types=Dict(
+        :RANDDT => Date,
+        :LSTALVDT => Date
+    ),
+    dateformat=dt_format,
+    missingstring=["", "NA"]
+)
+
+adrs = CSV.read("adrs_onco.csv", DataFrame,
+    types=Dict(
+        :ADT => Date
+    ),
+    dateformat=dt_format,
+    missingstring=["", "NA"]
+)
+```
+
+Explanation
+
+To create a clean and reusable way to define our analysis rules, we create a custom SourceDef struct. This modular approach mirrors the design of {admiral}'s event_source() and censor_source() functions in R.
+
+    struct SourceDef: Acts as a blueprint for a single event or censoring rule, bundling all its properties (dataset, filter logic, date column, etc.) into one object.
+
+    Helper Functions (event_source, censor_source): These functions provide a convenient and readable way to create instances of our SourceDef struct, closely matching the R syntax.
+
+```{julia}
+struct SourceDef
+    type::Symbol              # :event or :censor
+    dataset_name::Symbol      # :adsl or :adrs
+    filter::Union{Nothing, Function}
+    date::Symbol
+    set_values_to::Dict{Symbol, Any}
+end
+
+event_source(; dataset_name, filter=nothing, date, set_values_to=Dict()) =
+    SourceDef(:event, Symbol(dataset_name), filter, date, set_values_to)
+
+censor_source(; dataset_name, filter=nothing, date, set_values_to=Dict()) =
+    SourceDef(:censor, Symbol(dataset_name), filter, date, set_values_to)
+```
+
+Explanation
+
+Here, we use our SourceDef structure to define the specific business rules for the events and censoring conditions needed to calculate Overall Survival (OS) and Progression-Free Survival (PFS).
+
+    death_event: Defines a death event using the adrs dataset. The filter r -> ... is an anonymous function that selects rows where PARAMCD is "DEATH". If this rule is chosen for a subject, it sets the event description (EVNTDESC) to "Death".
+
+    pd_event: Defines a Progressive Disease event.
+
+    lastalive_censor, lasta_censor, rand_censor: Define the rules for censoring. Censoring occurs when the event of interest has not happened by the end of the observation period. The date is then taken from sources like the "Last Known Alive Date" (LSTALVDT) or the "Last Tumor Assessment".
+
+Abbreviations:
+
+    OS: Overall Survival
+
+    PFS: Progression-Free Survival
+
+    PARAMCD: Parameter Code (e.g., "DEATH", "PD")
+
+    ANL01FL: Analysis 01 Flag (Indicates if a record is used in analysis)
+
+```{julia}
+death_event = event_source(
+    dataset_name = "adrs",
+    filter = r -> !ismissing(r.PARAMCD) && r.PARAMCD == "DEATH" && !ismissing(r.AVALC) && r.AVALC == "Y" && !ismissing(r.ANL01FL) && r.ANL01FL == "Y",
+    date = :ADT,
+    set_values_to = Dict(:EVNTDESC => "Death", :SRCDOM => "ADRS", :SRCVAR => "ADT")
+)
+
+pd_event = event_source(
+    dataset_name = "adrs",
+    filter = r -> !ismissing(r.PARAMCD) && r.PARAMCD == "PD" && !ismissing(r.ANL01FL) && r.ANL01FL == "Y",
+    date = :ADT,
+    set_values_to = Dict(:EVNTDESC => "Progressive Disease", :SRCDOM => "ADRS", :SRCVAR => "ADT")
+)
+
+lastalive_censor = censor_source(
+    dataset_name = "adsl",
+    date = :LSTALVDT,
+    set_values_to = Dict(
+        :EVNTDESC => "Last Known Alive",
+        :CNSDTDSC => "Last Known Alive Date",
+        :SRCDOM   => "ADSL",
+        :SRCVAR   => "LSTALVDT"
+    )
+)
+
+lasta_censor = censor_source(
+    dataset_name = "adrs",
+    filter = r -> !ismissing(r.PARAMCD) && r.PARAMCD == "LSTA" && !ismissing(r.ANL01FL) && r.ANL01FL == "Y",
+    date = :ADT,
+    set_values_to = Dict(
+        :EVNTDESC => "Progression Free Alive",
+        :CNSDTDSC => "Last Tumor Assessment",
+        :SRCDOM   => "ADRS",
+        :SRCVAR   => "ADT"
+    )
+)
+
+rand_censor = censor_source(
+    dataset_name = "adsl",
+    date = :RANDDT,
+    set_values_to = Dict(
+        :EVNTDESC => "Randomization Date",
+        :CNSDTDSC => "Randomization Date",
+        :SRCDOM   => "ADSL",
+        :SRCVAR   => "RANDDT"
+    )
+)
+```
+
+Explanation
+
+This is a performance optimization. We create a function index_by_usubjid that converts our DataFrames into dictionaries. The dictionary keys are the USUBJIDs, and the values are the corresponding subject's data.
+
+    Why? The main derivation logic needs to look up data for each subject repeatedly. This indexing allows for near-instant access to a subject's records, which is much faster than searching the entire table in every iteration of the main loop.
+
+```{julia}
+function index_by_usubjid(df::DataFrame)
+    g = groupby(df, :USUBJID)
+    Dict(key.USUBJID => d for (key, d) in pairs(g))
+end
+
+idx_adsl = index_by_usubjid(adsl)
+idx_adrs = index_by_usubjid(adrs)
+```
+
+Explanation
+
+This is the core function of our TTE derivation, replicating the logic of admiral::derive_param_tte. It systematically determines the final TTE record for each subject.
+
+Process for each subject:
+
+    Collect Candidates: It iterates through all provided event and censor rules (event_conditions, censor_conditions), applies their filters, and gathers all valid dates into a temporary candidates DataFrame.
+
+    Select Earliest Date: It finds the record in the candidates DataFrame with the earliest date using argmin(candidates.ADT). This single record determines the subject's outcome (either an event or a censoring).
+
+    Store Result: The chosen record is appended to the final results DataFrame.
+
+```{julia}
+function derive_param_tte(;
+    dataset_adsl::DataFrame,
+    start_date::Symbol,
+    event_conditions::Vector{SourceDef},
+    censor_conditions::Vector{SourceDef},
+    source_datasets::Dict{Symbol, DataFrame},
+    set_values_to::Dict{Symbol, <:Any}
+)
+    out_cols = [:STUDYID, :USUBJID, :ADT, :EVNTDESC, :SRCDOM, :SRCVAR, :CNSR, :CNSDTDSC, :STARTDT, :PARAMCD, :PARAM]
+    results = DataFrame([c => Any[] for c in out_cols]...)
+
+    for row in eachrow(dataset_adsl)
+        usubjid = row.USUBJID
+        studyid = row.STUDYID
+        startdt = row[start_date]
+
+        candidates = DataFrame(
+            ADT = Date[], EVNTDESC = String[], SRCDOM = String[], SRCVAR = String[],
+            CNSR = Int[], CNSDTDSC = Union{Missing, String}[]
+        )
+        
+        all_conditions = vcat(event_conditions, censor_conditions)
+
+        for cond in all_conditions
+            ds_idx = cond.dataset_name == :adsl ? idx_adsl : idx_adrs
+            if haskey(ds_idx, usubjid)
+                dfsub = ds_idx[usubjid]
+                if cond.filter !== nothing
+                    dfsub_filtered = filter(cond.filter, dfsub)
+                else
+                    dfsub_filtered = dfsub
+                end
+                
+                for r in eachrow(dfsub_filtered)
+                    dt = r[cond.date]
+                    if !ismissing(dt)
+                        cnsr = cond.type == :event ? 0 : 1
+                        cnsdesc = get(cond.set_values_to, :CNSDTDSC, missing)
+                        push!(candidates, (dt, cond.set_values_to[:EVNTDESC], string(cond.set_values_to[:SRCDOM]), string(cond.set_values_to[:SRCVAR]), cnsr, cnsdesc))
+                    end
+                end
+            end
+        end
+
+        if nrow(candidates) == 0; continue; end
+
+        # Sort by date, then by CNSR to prioritize events (0) over censors (1) in ties.
+        sort!(candidates, [:ADT, :CNSR])
+        chosen = first(candidates)
+        
+        push!(results, (
+            studyid, usubjid, chosen.ADT, chosen.EVNTDESC, chosen.SRCDOM, chosen.SRCVAR,
+            chosen.CNSR, chosen.CNSDTDSC, startdt,
+            set_values_to[:PARAMCD], set_values_to[:PARAM]
+        ))
+    end
+    return results
+end
+```
+
+Explanation
+
+We now use the derive_param_tte function to generate the OS and PFS parameters.
+
+    adtte_os: To derive Overall Survival, we only consider one event: death_event.
+
+    adtte_pfs: To derive Progression-Free Survival, we consider two events: pd_event (Progressive Disease) and death_event. The logic will correctly choose whichever of these two events occurred first for each subject.
+
+    adtte = vcat(...): The OS and PFS results are stacked vertically (vcat) into a single, long-format ADTTE DataFrame, which is standard practice for ADaM datasets.
+
+
+```{julia}
+adtte_os = derive_param_tte(
+    dataset_adsl = adsl,
+    start_date = :RANDDT,
+    event_conditions = [death_event],
+    censor_conditions = [lastalive_censor, rand_censor],
+    source_datasets = Dict(:adsl => adsl, :adrs => adrs),
+    set_values_to = Dict(:PARAMCD => "OS", :PARAM => "Overall Survival")
+)
+
+adtte_pfs = derive_param_tte(
+    dataset_adsl = adsl,
+    start_date = :RANDDT,
+    event_conditions = [pd_event, death_event],
+    censor_conditions = [lasta_censor, rand_censor],
+    source_datasets = Dict(:adsl => adsl, :adrs => adrs),
+    set_values_to = Dict(:PARAMCD => "PFS", :PARAM => "Progression-Free Survival")
+)
+
+adtte = vcat(adtte_os, adtte_pfs)
+```
+
+```{julia}
+function derive_vars_duration(df::DataFrame; new_var::Symbol, start_date::Symbol, end_date::Symbol)
+    df = copy(df)
+    df[!, new_var] = Dates.value.(df[!, end_date] .- df[!, start_date]) .+ 1
+    return df
+end
+
+adtte_aval = derive_vars_duration(adtte; new_var=:AVAL, start_date=:STARTDT, end_date=:ADT)
+```
+
+```{julia}
+function derive_var_obs_number(df::DataFrame; by_vars::Vector{Symbol}, order::Vector{Symbol})
+    df_sorted = sort(df, vcat(by_vars, order))
+    combine(groupby(df_sorted, by_vars), x -> (x[!, :ASEQ] = 1:nrow(x); x))
+end
+
+adtte_aseq = derive_var_obs_number(adtte_aval; by_vars=[:STUDYID, :USUBJID], order=[:PARAMCD])
+
+# Select only the ADSL-specific columns to avoid duplicating columns already in ADTTE
+adsl_join = select(adsl, :STUDYID, :USUBJID, :SUBJID, :SITEID, :AGE, :AGEU, :SEX, :RACE, :ETHNIC, :ARMCD, :ARM, :ACTARMCD, :ACTARM, :COUNTRY, :TRT01P, :TRT01A, :SAFFL)
+
+adtte_adsl = leftjoin(adtte_aseq, adsl_join, on=[:STUDYID, :USUBJID])
+adtte_final = adtte_adsl
+
+# Display the final result to confirm it's populated
+println("Final ADTTE dataset created with $(nrow(adtte_final)) rows.")
+first(adtte_final, 5)
+```
+
+Explanation
+
+This block calculates AVAL (Analysis Value), which is the numerical duration for the time-to-event endpoint.
+
+    derive_vars_duration: This function subtracts the STARTDT from the ADT to get the duration.
+
+    Dates.value.(...): The date subtraction returns a Day object (e.g., 182 days). The . broadcasts the Dates.value function over this result to extract the raw integer value (e.g., 182), which is then stored in the AVAL column.
+
+Abbreviations:
+
+    AVAL: Analysis Value
+
+Explanation
+
+To complete our ADTTE dataset, we add the final required variables.
+
+    derive_var_obs_number: This function calculates the ASEQ (Analysis Sequence Number). It groups the data by subject and assigns a unique, ordered number to each parameter (OS and PFS) for that subject.
+
+    leftjoin(...): This function merges the subject-level variables from adsl (e.g., demographics, treatment arm) into our adtte dataset, matching on STUDYID and USUBJID. This is equivalent to R {admiral}'s derive_vars_merged.
+
+The resulting adtte_final DataFrame is now a complete ADTTE dataset ready for analysis.
+
+Abbreviations:
+
+    ASEQ: Analysis Sequence Number
+
+
+
